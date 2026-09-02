@@ -145,13 +145,20 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 	}
 }
 
+// isReferrersEntry reports whether a reference is a referrers fallback tag that
+// metadb should not index. A digest-shaped tag naming its own target is an
+// ordinary image and is indexed like any other.
+func isReferrersEntry(reference string, digest godigest.Digest) bool {
+	return zcommon.IsReferrersTag(reference) && !zcommon.IsDigestNamedTag(reference, digest.String())
+}
+
 // OnUpdateManifest is called when a new manifest is added. It updates metadb according to the type
 // of image pushed(normal images, signatures, etc.). In case of any errors, it makes sure to keep
 // consistency between metadb and the image store.
 func OnUpdateManifest(ctx context.Context, repo, reference, mediaType string, digest godigest.Digest, body []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
 ) error {
-	if zcommon.IsReferrersTag(reference) {
+	if isReferrersEntry(reference, digest) {
 		return nil
 	}
 
@@ -221,7 +228,7 @@ func OnUpdateManifestDigestTags(ctx context.Context, repo string, tags []string,
 func OnDeleteManifest(repo, reference, mediaType string, digest godigest.Digest, manifestBlob []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
 ) error {
-	if zcommon.IsReferrersTag(reference) {
+	if isReferrersEntry(reference, digest) {
 		// The store already deleted the referrers tag entry, which may have emptied the
 		// index; still attempt idle release (a no-op while content remains).
 		releaseIdleRepository(repo, storeController.GetImageStore(repo), metaDB, log)
@@ -332,7 +339,7 @@ func OnGetManifest(name, reference, mediaType string, body []byte,
 		return err
 	}
 
-	if isSignature || zcommon.IsReferrersTag(reference) {
+	if isSignature || isReferrersEntry(reference, godigest.FromBytes(body)) {
 		return nil
 	}
 

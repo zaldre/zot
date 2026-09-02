@@ -174,3 +174,36 @@ func TestCommon(t *testing.T) {
 		So(result, ShouldBeFalse)
 	})
 }
+
+func TestReferrersTagDiscrimination(t *testing.T) {
+	const (
+		hex   = "4a62254e90931470fb90c29362803fe7dada22107229ec2351bd33560c1dceb0"
+		other = "2d1acb6e828945aeadeee396baea355e3fb81101809ef836bc30892a4f284dfe"
+	)
+
+	Convey("only the exact referrers schema is a referrers tag", t, func() {
+		// Shapes that merely contain or resemble a digest are ordinary tags.
+		So(common.IsReferrersTag("1.0.0"), ShouldBeFalse)
+		So(common.IsReferrersTag("abc-123"), ShouldBeFalse)
+		So(common.IsReferrersTag("sha256"+hex), ShouldBeFalse)          // no separator
+		So(common.IsReferrersTag("sha256-abc123def456"), ShouldBeFalse) // too short
+		So(common.IsReferrersTag("sha256-zzz"), ShouldBeFalse)          // not hex
+		So(common.IsReferrersTag("notsha256-"+hex), ShouldBeFalse)      // unanchored head
+		So(common.IsReferrersTag("v1-sha256-"+hex), ShouldBeFalse)      // unanchored head
+		So(common.IsReferrersTag("sha256-"+hex+".sig"), ShouldBeFalse)  // cosign, has a tail
+
+		So(common.IsReferrersTag("sha256-"+hex), ShouldBeTrue)
+	})
+
+	Convey("a digest-named tag is an image, not a referrers entry", t, func() {
+		// oc-mirror renders repo@sha256:x as repo:sha256-x, so the tag names the
+		// digest of the manifest it resolves to. A referrers tag names the
+		// SUBJECT's digest and therefore never matches its own target.
+		So(common.IsDigestNamedTag("sha256-"+hex, "sha256:"+hex), ShouldBeTrue)
+		So(common.IsDigestNamedTag("sha256-"+hex, "sha256:"+other), ShouldBeFalse)
+
+		So(common.IsDigestNamedTag("1.0.0", "sha256:"+hex), ShouldBeFalse)
+		So(common.IsDigestNamedTag("sha256-"+hex, "nocolon"), ShouldBeFalse)
+		So(common.IsDigestNamedTag("", ""), ShouldBeFalse)
+	})
+}
