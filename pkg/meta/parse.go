@@ -248,7 +248,7 @@ func parseRepo(repo string, metaDB mTypes.MetaDB, storeController stypes.StoreCo
 
 	for _, manifest := range indexContent.Manifests {
 		tag := manifest.Annotations[ispec.AnnotationRefName]
-		if tag != "" && !zcommon.IsReferrersTag(tag) {
+		if tag != "" && !isReferrersEntry(tag, manifest.Digest) {
 			tagsToKeep[tag] = true
 		}
 	}
@@ -265,7 +265,7 @@ func parseRepo(repo string, metaDB mTypes.MetaDB, storeController stypes.StoreCo
 	for _, manifest := range indexContent.Manifests {
 		tag := manifest.Annotations[ispec.AnnotationRefName]
 
-		if zcommon.IsReferrersTag(tag) {
+		if isReferrersEntry(tag, manifest.Digest) {
 			continue
 		}
 
