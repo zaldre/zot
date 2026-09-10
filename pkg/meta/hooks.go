@@ -148,8 +148,11 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 // isReferrersEntry reports whether a reference is a referrers fallback tag that
 // metadb should not index. A digest-shaped tag naming its own target is an
 // ordinary image and is indexed like any other.
+//
+// Digest-typed adapter for zcommon.IsReferrersEntry, which pkg/extensions/sync
+// applies to the same shape.
 func isReferrersEntry(reference string, digest godigest.Digest) bool {
-	return zcommon.IsReferrersTag(reference) && !zcommon.IsDigestNamedTag(reference, digest.String())
+	return zcommon.IsReferrersEntry(reference, digest.String())
 }
 
 // OnUpdateManifest is called when a new manifest is added. It updates metadb according to the type
@@ -349,7 +352,15 @@ func OnGetManifest(name, reference, mediaType string, body []byte,
 		return err
 	}
 
-	if isSignature || isReferrersEntry(reference, godigest.FromBytes(body)) {
+	if isSignature {
+		return nil
+	}
+
+	// Unlike the other hooks this one has only the body, so the digest the
+	// discriminator needs has to be computed. Gate that on the shape test, which is
+	// a regexp over the reference, so ordinary manifest GETs do not pay for a hash
+	// that only a referrers-shaped reference can use.
+	if zcommon.IsReferrersTag(reference) && isReferrersEntry(reference, godigest.FromBytes(body)) {
 		return nil
 	}
 

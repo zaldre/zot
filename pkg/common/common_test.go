@@ -206,4 +206,22 @@ func TestReferrersTagDiscrimination(t *testing.T) {
 		So(common.IsDigestNamedTag("sha256-"+hex, "nocolon"), ShouldBeFalse)
 		So(common.IsDigestNamedTag("", ""), ShouldBeFalse)
 	})
+
+	Convey("IsReferrersEntry requires the shape and a digest it does not name", t, func() {
+		// The shared discriminator: only a referrers-shaped tag pointing at some OTHER
+		// manifest is a referrers entry. metadb skips exactly these, and sync declines
+		// to copy them as images.
+		So(common.IsReferrersEntry("sha256-"+hex, "sha256:"+other), ShouldBeTrue)
+
+		// Self-naming -- an image tagged by digest, not a referrers entry.
+		So(common.IsReferrersEntry("sha256-"+hex, "sha256:"+hex), ShouldBeFalse)
+
+		// Wrong shape, whatever the digest.
+		So(common.IsReferrersEntry("1.0.0", "sha256:"+other), ShouldBeFalse)
+		So(common.IsReferrersEntry("v1-sha256-"+hex, "sha256:"+other), ShouldBeFalse)
+		So(common.IsReferrersEntry("sha256-"+hex+".sig", "sha256:"+other), ShouldBeFalse)
+
+		// A digest reference rather than a tag: the separator is a colon, not a hyphen.
+		So(common.IsReferrersEntry("sha256:"+hex, "sha256:"+hex), ShouldBeFalse)
+	})
 }

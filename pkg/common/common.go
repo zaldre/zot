@@ -160,6 +160,16 @@ func IsDigestNamedTag(tag, digest string) bool {
 	return found && tag == alg+"-"+hex
 }
 
+// IsReferrersEntry reports whether a reference is a referrers fallback tag, and
+// therefore a transport artifact rather than content in its own right.
+//
+// This is the discriminator shared by metadb and sync: referrers-shaped, and not
+// naming its own target. Shape alone is not enough, because an image tagged by
+// digest has exactly the same shape -- see IsDigestNamedTag.
+func IsReferrersEntry(tag, digest string) bool {
+	return IsReferrersTag(tag) && !IsDigestNamedTag(tag, digest)
+}
+
 func IsContextDone(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
