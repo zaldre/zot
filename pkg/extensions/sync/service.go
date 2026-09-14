@@ -613,8 +613,9 @@ func (service *BaseService) SyncRepo(ctx context.Context, repo string) error {
 			return ctx.Err()
 		}
 
-		// skip referrers tags and cosign tags here; they are synced via syncReferrers in syncImage.
-		if common.IsCosignTag(tag) || common.IsReferrersTag(tag) {
+		// Cosign tags are decided by shape alone, so they cost no request; they are
+		// synced via syncReferrers in syncImage.
+		if common.IsCosignTag(tag) {
 			continue
 		}
 
@@ -637,6 +638,16 @@ func (service *BaseService) SyncRepo(ctx context.Context, repo string) error {
 				Str("tag", tag).Err(err).Msg("error while resolving tag for periodic sync")
 
 			return err
+		}
+
+		// A referrers fallback tag names the SUBJECT's digest, so it never resolves to the
+		// manifest it names; those are synced via syncReferrers in syncImage. A tag that
+		// does name its own target is an ordinary image tagged by digest -- the shape a
+		// mirroring tool writes for a digest-pinned source -- and is synced like any other
+		// tag. Shape cannot tell the two apart, so this reuses the digest resolved above
+		// rather than paying for a request of its own.
+		if common.IsReferrersEntry(tag, tagContentDigest.String()) {
+			continue
 		}
 
 		// Sparse index (or single image) first, then ensure allowlisted / all child digests.
@@ -1076,7 +1087,7 @@ func (service *BaseService) syncImage(ctx context.Context, localRepo, remoteRepo
 
 		checkIsSigned := service.config.OnlySigned != nil && *service.config.OnlySigned &&
 			!opts.SkipOnlySigned &&
-			!common.IsCosignSignature(tag) && !common.IsReferrersTag(tag)
+			!common.IsCosignSignature(tag) && !common.IsReferrersEntry(tag, remoteDigest.String())
 
 		// if onlySigned flag true in config and the image is not itself a signature
 		if checkIsSigned {

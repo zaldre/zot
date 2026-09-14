@@ -194,7 +194,14 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 	*seen = append(*seen, desc.Digest)
 
 	imageStore := registry.storeController.GetImageStore(repo)
-	isReferrersRef := common.IsReferrersTag(reference)
+
+	// A referrers fallback tag names the SUBJECT's digest, so it never names the
+	// manifest it tags. One that does name its own target is an ordinary image or
+	// index tagged by digest -- the shape a mirroring tool writes for a
+	// digest-pinned source -- and has to be committed like any other reference.
+	// Dropping it here is what left on-demand pull-through answering
+	// MANIFEST_UNKNOWN for "repo:sha256-<hex>" that upstream serves.
+	isReferrersRef := common.IsReferrersEntry(reference, desc.Digest.String())
 
 	manifestContent := desc.Data
 	if manifestContent == nil {

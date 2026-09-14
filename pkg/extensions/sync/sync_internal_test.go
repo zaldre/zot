@@ -2050,6 +2050,167 @@ func TestCopyManifestInvalidJSON(t *testing.T) {
 	})
 }
 
+func TestSyncRepoReferrersTagDiscrimination(t *testing.T) {
+	Convey("SyncRepo syncs digest-named tags but not referrers entries", t, func() {
+		const (
+			hex   = "4a62254e90931470fb90c29362803fe7dada22107229ec2351bd33560c1dceb0"
+			other = "2d1acb6e828945aeadeee396baea355e3fb81101809ef836bc30892a4f284dfe"
+		)
+
+		digestNamedTag := "sha256-" + hex   // an image tagged by its own digest
+		referrersTag := "sha256-" + other   // a referrers entry: names another manifest
+		cosignTag := "sha256-" + other + ".sig"
+
+		conf := syncconf.RegistryConfig{URLs: []string{"http://localhost"}}
+
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{},
+			mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+
+		var headed, synced []string
+
+		service.remote = &mocks.SyncRemoteMock{
+			GetTagsFn: func(_ context.Context, _ string) ([]string, error) {
+				return []string{"1.0.0", digestNamedTag, referrersTag, cosignTag}, nil
+			},
+			HeadManifestFn: func(_ context.Context, _, tag string) (godigest.Digest, string, error) {
+				headed = append(headed, tag)
+
+				switch tag {
+				case digestNamedTag:
+					// The tag names the manifest it resolves to.
+					return godigest.Digest("sha256:" + hex), ispec.MediaTypeImageManifest, nil
+				case referrersTag:
+					// A referrers tag names the SUBJECT, so it resolves to some other manifest.
+					return godigest.Digest("sha256:" + hex), ispec.MediaTypeImageManifest, nil
+				default:
+					return godigest.Digest("sha256:" + other), ispec.MediaTypeImageManifest, nil
+				}
+			},
+		}
+
+		// syncImage reaches the destination first; record the tag and bail out with a
+		// skippable error so the loop continues to the next tag.
+		service.destination = &mocks.SyncDestinationMock{
+			GetImageReferenceFn: func(_ string, tag string) (ref.Ref, error) {
+				synced = append(synced, tag)
+
+				return ref.Ref{}, zerr.ErrManifestNotFound
+			},
+		}
+
+		err = service.SyncRepo(context.Background(), "repo")
+		So(err, ShouldBeNil)
+
+		// The cosign tag is rejected on shape, so it never costs a request.
+		So(headed, ShouldNotContain, cosignTag)
+		So(synced, ShouldNotContain, cosignTag)
+
+		// A referrers entry is resolved once, then left to syncReferrers.
+		So(headed, ShouldContain, referrersTag)
+		So(synced, ShouldNotContain, referrersTag)
+
+		// An ordinary tag and a digest-named one are both synced.
+		So(synced, ShouldContain, "1.0.0")
+		So(synced, ShouldContain, digestNamedTag)
+
+		// The discriminator reuses the digest SyncRepo already resolved, so a
+		// digest-named tag costs no more requests than an ordinary one.
+		So(headed, ShouldResemble, []string{"1.0.0", digestNamedTag, referrersTag})
+	})
+}
+
+func TestCopyManifestDigestNamedTag(t *testing.T) {
+	Convey("a tag naming its own digest is committed like any other tag", t, func() {
+		// oc-mirror renders repo@sha256:x as repo:sha256-x, so the tag has the referrers
+		// fallback shape while naming the manifest it resolves to. Treating it as a
+		// referrers entry dropped it here, which is why on-demand pull-through answered
+		// MANIFEST_UNKNOWN for a reference upstream served.
+		log := log.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+
+		repoName := "repo"
+
+		Convey("digest-named manifest entry is committed", func() {
+			tempDir := t.TempDir()
+			destDir := t.TempDir()
+			tempStore := local.NewImageStore(tempDir, true, true, log, metrics, nil, nil, nil, nil)
+			destStore := local.NewImageStore(destDir, true, true, log, metrics, nil, nil, nil, nil)
+			tempController := storage.StoreController{DefaultStore: tempStore}
+			destController := storage.StoreController{DefaultStore: destStore}
+			destReg := NewDestinationRegistry(destController, tempController, nil, log).(*DestinationRegistry)
+
+			image := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
+			manifestContent, err := json.Marshal(image.Manifest)
+			So(err, ShouldBeNil)
+
+			manifestDigest := godigest.FromBytes(manifestContent)
+			digestNamedTag := "sha256-" + manifestDigest.Encoded()
+
+			err = WriteImageToFileSystem(image, repoName, digestNamedTag, tempController)
+			So(err, ShouldBeNil)
+
+			desc := ispec.Descriptor{
+				Digest:    manifestDigest,
+				MediaType: ispec.MediaTypeImageManifest,
+				Size:      int64(len(manifestContent)),
+			}
+			seen := &[]godigest.Digest{}
+
+			err = destReg.copyManifest(repoName, desc, digestNamedTag, tempStore, seen)
+			So(err, ShouldBeNil)
+
+			// Shape alone still reads as a referrers tag, so assert on the tag itself.
+			So(common.IsReferrersTag(digestNamedTag), ShouldBeTrue)
+
+			tags, err := destStore.GetImageTags(repoName)
+			So(err, ShouldBeNil)
+			So(tags, ShouldContain, digestNamedTag)
+
+			_, gotDigest, _, err := destStore.GetImageManifest(repoName, digestNamedTag)
+			So(err, ShouldBeNil)
+			So(gotDigest, ShouldEqual, manifestDigest)
+		})
+
+		Convey("digest-named index is committed with its children", func() {
+			tempDir := t.TempDir()
+			destDir := t.TempDir()
+			tempStore := local.NewImageStore(tempDir, true, true, log, metrics, nil, nil, nil, nil)
+			destStore := local.NewImageStore(destDir, true, true, log, metrics, nil, nil, nil, nil)
+			tempController := storage.StoreController{DefaultStore: tempStore}
+			destController := storage.StoreController{DefaultStore: destStore}
+			destReg := NewDestinationRegistry(destController, tempController, nil, log).(*DestinationRegistry)
+
+			childImage := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
+			index := CreateMultiarchWith().Images([]Image{childImage}).Build()
+
+			indexDigest := index.IndexDescriptor.Digest
+			digestNamedTag := "sha256-" + indexDigest.Encoded()
+
+			err := WriteMultiArchImageToFileSystem(index, repoName, digestNamedTag, tempController)
+			So(err, ShouldBeNil)
+
+			seen := &[]godigest.Digest{}
+
+			err = destReg.copyManifest(repoName, index.IndexDescriptor, digestNamedTag, tempStore, seen)
+			So(err, ShouldBeNil)
+
+			tags, err := destStore.GetImageTags(repoName)
+			So(err, ShouldBeNil)
+			So(tags, ShouldContain, digestNamedTag)
+
+			_, gotDigest, _, err := destStore.GetImageManifest(repoName, digestNamedTag)
+			So(err, ShouldBeNil)
+			So(gotDigest, ShouldEqual, indexDigest)
+
+			// The per-arch children are referenced by digest, so they are committed too.
+			_, childDigest, _, err := destStore.GetImageManifest(repoName, childImage.Digest().String())
+			So(err, ShouldBeNil)
+			So(childDigest, ShouldEqual, childImage.Digest())
+		})
+	})
+}
+
 func TestCopyManifestReferrersTag(t *testing.T) {
 	Convey("referrers-shaped layout entries are not committed as tags", t, func() {
 		log := log.NewTestLogger()
