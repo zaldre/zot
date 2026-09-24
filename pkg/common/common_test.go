@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	notreg "github.com/notaryproject/notation-go/registry"
+	godigest "github.com/opencontainers/go-digest"
 	. "github.com/smartystreets/goconvey/convey"
 
 	"zotregistry.dev/zot/v2/pkg/api/config"
@@ -172,5 +173,64 @@ func TestCommon(t *testing.T) {
 		result, err := common.AreSocketsEqual("localhost:9000", "127.0.0.1")
 		So(err, ShouldNotBeNil)
 		So(result, ShouldBeFalse)
+	})
+}
+
+func TestReferrersTagDiscrimination(t *testing.T) {
+	const (
+		hex   = "4a62254e90931470fb90c29362803fe7dada22107229ec2351bd33560c1dceb0"
+		other = "2d1acb6e828945aeadeee396baea355e3fb81101809ef836bc30892a4f284dfe"
+	)
+
+	Convey("only the exact referrers schema is a referrers tag", t, func() {
+		// Shapes that merely contain or resemble a digest are ordinary tags.
+		So(common.IsReferrersTag("1.0.0"), ShouldBeFalse)
+		So(common.IsReferrersTag("abc-123"), ShouldBeFalse)
+		So(common.IsReferrersTag("sha256"+hex), ShouldBeFalse)          // no separator
+		So(common.IsReferrersTag("sha256-abc123def456"), ShouldBeFalse) // too short
+		So(common.IsReferrersTag("sha256-zzz"), ShouldBeFalse)          // not hex
+		So(common.IsReferrersTag("notsha256-"+hex), ShouldBeFalse)      // unanchored head
+		So(common.IsReferrersTag("v1-sha256-"+hex), ShouldBeFalse)      // unanchored head
+		So(common.IsReferrersTag("sha256-"+hex+".sig"), ShouldBeFalse)  // cosign, has a tail
+
+		// go-digest encodes sha256 as `^[a-f0-9]{64}$`, so an uppercase tag is a legal
+		// OCI tag that no digest can equal -- ordinary content, not a referrers entry.
+		So(common.IsReferrersTag("sha256-"+strings.ToUpper(hex)), ShouldBeFalse)
+
+		So(common.IsReferrersTag("sha256-"+hex), ShouldBeTrue)
+	})
+
+	Convey("a digest-named tag is an image, not a referrers entry", t, func() {
+		// oc-mirror renders repo@sha256:x as repo:sha256-x, so the tag names the
+		// digest of the manifest it resolves to. A referrers tag names the
+		// SUBJECT's digest and therefore never matches its own target.
+		So(common.IsDigestNamedTag("sha256-"+hex, godigest.Digest("sha256:"+hex)), ShouldBeTrue)
+		So(common.IsDigestNamedTag("sha256-"+hex, godigest.Digest("sha256:"+other)), ShouldBeFalse)
+
+		So(common.IsDigestNamedTag("1.0.0", godigest.Digest("sha256:"+hex)), ShouldBeFalse)
+		So(common.IsDigestNamedTag("sha256-"+hex, godigest.Digest("nocolon")), ShouldBeFalse)
+		So(common.IsDigestNamedTag("", godigest.Digest("")), ShouldBeFalse)
+	})
+
+	Convey("IsReferrersEntry requires the shape and a digest it does not name", t, func() {
+		// The shared discriminator: only a referrers-shaped tag pointing at some OTHER
+		// manifest is a referrers entry. metadb skips exactly these, and sync declines
+		// to copy them as images.
+		So(common.IsReferrersEntry("sha256-"+hex, godigest.Digest("sha256:"+other)), ShouldBeTrue)
+
+		// Self-naming -- an image tagged by digest, not a referrers entry.
+		So(common.IsReferrersEntry("sha256-"+hex, godigest.Digest("sha256:"+hex)), ShouldBeFalse)
+
+		// Wrong shape, whatever the digest.
+		So(common.IsReferrersEntry("1.0.0", godigest.Digest("sha256:"+other)), ShouldBeFalse)
+		So(common.IsReferrersEntry("v1-sha256-"+hex, godigest.Digest("sha256:"+other)), ShouldBeFalse)
+		So(common.IsReferrersEntry("sha256-"+hex+".sig", godigest.Digest("sha256:"+other)), ShouldBeFalse)
+
+		// A digest reference rather than a tag: the separator is a colon, not a hyphen.
+		So(common.IsReferrersEntry("sha256:"+hex, godigest.Digest("sha256:"+hex)), ShouldBeFalse)
+
+		// A digest carrying no separator must not panic the way Algorithm() would.
+		So(common.IsReferrersEntry("sha256-"+hex, godigest.Digest("nosep")), ShouldBeTrue)
+		So(common.IsDigestNamedTag("sha256-"+hex, godigest.Digest("")), ShouldBeFalse)
 	})
 }

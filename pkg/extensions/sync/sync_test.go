@@ -5837,6 +5837,116 @@ func TestOnDemandWithDigest(t *testing.T) {
 	})
 }
 
+func TestSyncDigestNamedTag(t *testing.T) {
+	Convey("Verify a tag that names its own digest is synced like any other tag", t, func() {
+		// oc-mirror renders repo@sha256:x as repo:sha256-x, so the tag carries the
+		// referrers fallback shape while naming the manifest it resolves to. A referrers
+		// tag names the SUBJECT's digest and so never matches its own target, which is
+		// what tells the two apart.
+		sctlr, _, _ := makeUpstreamServer(t, false, false)
+
+		scm := test.NewControllerManager(sctlr)
+		srcBaseURL := scm.StartAndWait()
+
+		defer scm.StopServer()
+
+		resp, err := resty.R().Get(srcBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		manifestBlob := resp.Body()
+		manifestDigest := godigest.FromBytes(manifestBlob)
+		digestNamedTag := manifestDigest.Algorithm().String() + "-" + manifestDigest.Encoded()
+
+		resp, err = resty.R().SetHeader("Content-type", ispec.MediaTypeImageManifest).
+			SetBody(manifestBlob).
+			Put(srcBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
+
+		var tlsVerify bool
+
+		maxRetries := 1
+		delay := 1 * time.Second
+
+		Convey("on demand", func() {
+			syncRegistryConfig := syncconf.RegistryConfig{
+				Content:    []syncconf.Content{{Prefix: testImage}},
+				URLs:       []string{srcBaseURL},
+				OnDemand:   true,
+				TLSVerify:  &tlsVerify,
+				MaxRetries: &maxRetries,
+				RetryDelay: &delay,
+			}
+
+			defaultVal := true
+			syncConfig := &syncconf.Config{
+				Enable:     &defaultVal,
+				Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+			}
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			// This is the pull-through reported on the issue: upstream serves the
+			// reference, downstream used to answer MANIFEST_UNKNOWN.
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, manifestDigest)
+
+			// It is committed as a tag, not merely pullable by digest.
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(string(resp.Body()), ShouldContainSubstring, digestNamedTag)
+		})
+
+		Convey("periodic", func() {
+			updateDuration, _ := time.ParseDuration("30m")
+
+			syncRegistryConfig := syncconf.RegistryConfig{
+				Content:      []syncconf.Content{{Prefix: testImage}},
+				URLs:         []string{srcBaseURL},
+				PollInterval: updateDuration,
+				TLSVerify:    &tlsVerify,
+				MaxRetries:   &maxRetries,
+				RetryDelay:   &delay,
+			}
+
+			defaultVal := true
+			syncConfig := &syncconf.Config{
+				Enable:     &defaultVal,
+				Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+			}
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, testImage, 60*time.Second), ShouldBeTrue)
+
+			// OnDemand is off, so a hit here can only come from the periodic run.
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, manifestDigest)
+
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(string(resp.Body()), ShouldContainSubstring, digestNamedTag)
+		})
+	})
+}
+
 func TestOnDemandRetryGoroutineErr(t *testing.T) {
 	Convey("Verify ondemand sync retries in background on error", t, func() {
 		regex := ".*"
