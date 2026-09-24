@@ -155,7 +155,7 @@ func rollbackDigestManifestTags(ctx context.Context, repo string, tags, appliedM
 func OnUpdateManifest(ctx context.Context, repo, reference, mediaType string, digest godigest.Digest, body []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
 ) error {
-	if zcommon.IsReferrersTag(reference) {
+	if zcommon.IsReferrersEntry(reference, digest) {
 		return nil
 	}
 
@@ -225,7 +225,7 @@ func OnUpdateManifestDigestTags(ctx context.Context, repo string, tags []string,
 func OnDeleteManifest(repo, reference, mediaType string, digest godigest.Digest, manifestBlob []byte,
 	storeController storage.StoreController, metaDB mTypes.MetaDB, log log.Logger,
 ) error {
-	if zcommon.IsReferrersTag(reference) {
+	if zcommon.IsReferrersEntry(reference, digest) {
 		// The store already deleted the referrers tag entry, which may have emptied the
 		// index; still attempt idle release (a no-op while content remains).
 		releaseIdleRepository(repo, storeController, metaDB, log)
@@ -346,7 +346,16 @@ func OnGetManifest(name, reference, mediaType string, body []byte,
 		return err
 	}
 
-	if isSignature || zcommon.IsReferrersTag(reference) {
+	if isSignature {
+		return nil
+	}
+
+	// Same discriminator as zcommon.IsReferrersEntry, spelled out because this hook
+	// has only the body: the digest has to be computed, so the shape test -- a regexp
+	// over the reference -- goes first and ordinary manifest GETs never pay for a hash
+	// that only a referrers-shaped reference can use.
+	if zcommon.IsReferrersTag(reference) &&
+		!zcommon.IsDigestNamedTag(reference, godigest.FromBytes(body)) {
 		return nil
 	}
 

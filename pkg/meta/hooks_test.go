@@ -502,13 +502,16 @@ func TestUpdateErrors(t *testing.T) {
 		metaDB := mocks.MetaDBMock{}
 		log := log.NewTestLogger()
 
+		// A referrers tag carries the full hex encoding of the subject digest.
+		referrersTag := "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 		Convey("IsReferrersTag true update", func() {
-			err := meta.OnUpdateManifest(context.Background(), "repo", "sha256-123", "digest", "media", []byte("bad"),
-				storeController, metaDB, log)
+			err := meta.OnUpdateManifest(context.Background(), "repo", referrersTag, "digest", "media",
+				[]byte("bad"), storeController, metaDB, log)
 			So(err, ShouldBeNil)
 		})
 		Convey("IsReferrersTag true delete", func() {
-			err := meta.OnDeleteManifest("repo", "sha256-123", "digest", "media", []byte("bad"),
+			err := meta.OnDeleteManifest("repo", referrersTag, "digest", "media", []byte("bad"),
 				storeController, metaDB, log)
 			So(err, ShouldBeNil)
 		})

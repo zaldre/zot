@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -127,12 +129,53 @@ func ContainsStringIgnoreCase(strSlice []string, str string) bool {
 	})
 }
 
-// IsReferrersTag checks if tag is a referrers tag
-// (https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema).
-func IsReferrersTag(tag string) bool {
-	referrersTagRule := regexp.MustCompile(`sha256\-[A-Za-z0-9]*$`)
+// referrersTagRule matches the referrers fallback tag schema exactly: the
+// algorithm, a hyphen, and the full hex encoding of a digest. It is anchored at
+// both ends deliberately. An unanchored rule also matches any tag that merely
+// ENDS in something digest-shaped -- "v1-sha256-abcdef", "notsha256-abcdef" --
+// and a permissive character class matches short suffixes like "sha256-zzz"
+// that no digest can produce.
+//
+// Hex is lowercase only, matching go-digest's own `^[a-f0-9]{64}$` for sha256.
+// An uppercase tag is a legal OCI tag that no digest encoding can equal, so it
+// is ordinary content rather than a referrers entry.
+var referrersTagRule = regexp.MustCompile(`^sha256-[a-f0-9]{64}$`)
 
+// IsReferrersTag checks if tag has the referrers tag schema shape
+// (https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema).
+//
+// Shape alone does not prove a tag IS a referrers entry -- see IsDigestNamedTag.
+func IsReferrersTag(tag string) bool {
 	return referrersTagRule.MatchString(tag)
+}
+
+// IsDigestNamedTag reports whether tag names the digest of the manifest it
+// resolves to.
+//
+// Such a tag has the referrers fallback shape but is not a referrers entry. The
+// referrers schema names the SUBJECT's digest, so the index it tags is by
+// construction a different manifest than the one named. A tag that names its
+// own target is instead an ordinary image tagged by digest, which is what
+// mirroring tools write when the source was pinned by digest -- oc-mirror
+// renders "repo@sha256:x" as "repo:sha256-x". Treating those as referrers hides
+// real images from metadb, and therefore from the search extension and the UI,
+// while leaving them fully served over the distribution API.
+func IsDigestNamedTag(tag string, dgst digest.Digest) bool {
+	// Parsed by hand rather than via Algorithm()/Encoded(), which panic on a digest
+	// carrying no separator; callers reach here with whatever the store held.
+	alg, hex, found := strings.Cut(dgst.String(), ":")
+
+	return found && tag == alg+"-"+hex
+}
+
+// IsReferrersEntry reports whether a reference is a referrers fallback tag, and
+// therefore a transport artifact rather than content in its own right.
+//
+// This is the discriminator shared by metadb and sync: referrers-shaped, and not
+// naming its own target. Shape alone is not enough, because an image tagged by
+// digest has exactly the same shape -- see IsDigestNamedTag.
+func IsReferrersEntry(tag string, dgst digest.Digest) bool {
+	return IsReferrersTag(tag) && !IsDigestNamedTag(tag, dgst)
 }
 
 func IsContextDone(ctx context.Context) bool {
