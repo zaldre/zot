@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"path"
@@ -26,6 +27,7 @@ import (
 	"github.com/regclient/regclient/types/mediatype"
 	"github.com/regclient/regclient/types/platform"
 	"github.com/regclient/regclient/types/ref"
+	"github.com/regclient/regclient/types/referrer"
 	"golang.org/x/sync/singleflight"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -767,8 +769,8 @@ func (service *BaseService) SyncRepo(ctx context.Context, repo string) error {
 			return ctx.Err()
 		}
 
-		// skip referrers tags and cosign tags here; they are synced via syncReferrers in syncImage.
-		if common.IsCosignTag(tag) || common.IsReferrersTag(tag) {
+		// skip cosign tags here; they are synced via syncReferrers in syncImage.
+		if common.IsCosignTag(tag) {
 			continue
 		}
 
@@ -787,10 +789,22 @@ func (service *BaseService) SyncRepo(ctx context.Context, repo string) error {
 				continue
 			}
 
+			// Without the digest a referrers-shaped tag cannot be classified; skip it as before
+			// rather than failing the repo. A digest-named image is picked up on the next poll.
+			if common.IsReferrersTag(tag) {
+				continue
+			}
+
 			service.log.Error().Str("errorType", common.TypeOf(err)).Str("repo", repo).
 				Str("tag", tag).Err(err).Msg("error while resolving tag for periodic sync")
 
 			return err
+		}
+
+		// skip referrers tags here; they are synced via syncReferrers in syncImage. A tag naming
+		// its own digest is an image tagged by digest and is synced like any other tag.
+		if common.IsReferrersEntry(tag, tagContentDigest) {
+			continue
 		}
 
 		// Sparse index (or single image) first, then ensure allowlisted / all child digests.
@@ -1298,13 +1312,13 @@ func (service *BaseService) enforceOnlySigned(ctx context.Context, remoteRepo, t
 ) error {
 	checkIsSigned := service.config.OnlySigned != nil && *service.config.OnlySigned &&
 		!skipOnlySigned &&
-		!common.IsCosignSignature(tag) && !common.IsReferrersTag(tag)
+		!common.IsCosignSignature(tag) && !common.IsReferrersEntry(tag, remoteDigest)
 
 	if !checkIsSigned {
 		return nil
 	}
 
-	referrers, err := service.rc.ReferrerList(ctx, remoteImageRef)
+	referrers, err := service.getReferrers(ctx, remoteRepo, remoteImageRef, remoteDigest)
 	if err != nil {
 		service.log.Error().Str("errorType", common.TypeOf(err)).Str("repo", remoteRepo).
 			Err(err).Msg("failed to get referrers for repo")
@@ -1429,6 +1443,15 @@ func (service *BaseService) syncImage(ctx context.Context, localRepo, remoteRepo
 
 		if opts.WithReferrers {
 			_ = service.syncReferrers(ctx, repoTags, localRepo, remoteRepo, localImageRef, remoteImageRef, true)
+
+			if common.IsDigestNamedTag(tag, remoteDigest) {
+				if err := service.restoreDigestNamedTag(ctx, localImageRef, remoteDigest); err != nil {
+					service.log.Error().Err(err).Str("errortype", common.TypeOf(err)).
+						Str("repo", localRepo).Str("reference", tag).Msg("failed to restore image tag after referrers sync")
+
+					return err
+				}
+			}
 		}
 
 		return nil
@@ -1489,6 +1512,55 @@ func (service *BaseService) getTagsUnlocked(ctx context.Context, repo string, no
 	return tags, nil
 }
 
+// restoreDigestNamedTag points the tag of localImageRef back at the image it names. The temp layout keeps
+// an image's referrers under its fallback tag "sha256-<digest>", which for an image tagged by its own digest
+// is that tag. The image is not staged when syncRef found it already synced, so there is nothing to restore.
+func (service *BaseService) restoreDigestNamedTag(ctx context.Context, localImageRef ref.Ref,
+	digest godigest.Digest,
+) error {
+	stagedImage, err := service.rc.ManifestGet(ctx, localImageRef.SetDigest(digest.String()))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	return service.rc.ManifestPut(ctx, localImageRef, stagedImage)
+}
+
+// getReferrers lists the referrers of subject, whose digest is subjectDigest. An upstream without the
+// referrers API serves them from the fallback tag "sha256-<digest>", which an image tagged by its own
+// digest occupies; such a subject has no referrers there, rather than an error or its own index children.
+// Caller must hold clientLock for reading (uses remote and rc).
+func (service *BaseService) getReferrers(ctx context.Context, remoteRepo string, subject ref.Ref,
+	subjectDigest godigest.Digest,
+) (referrer.ReferrerList, error) {
+	referrers, err := service.rc.ReferrerList(ctx, subject)
+	if err == nil {
+		if referrers.Manifest != nil && referrers.Manifest.GetDescriptor().Digest == subjectDigest {
+			return referrer.New(subject), nil
+		}
+
+		return referrers, nil
+	}
+
+	// The fallback tag holding something other than an index fails the listing; only pay for this
+	// HEAD on that error path.
+	fallbackTag, tagErr := referrer.FallbackTag(subject.SetDigest(subjectDigest.String()))
+	if tagErr != nil {
+		return referrers, err
+	}
+
+	tagDigest, _, headErr := service.remote.HeadManifest(ctx, remoteRepo, fallbackTag.Tag)
+	if headErr == nil && tagDigest == subjectDigest {
+		return referrer.New(subject), nil
+	}
+
+	return referrers, err
+}
+
 // syncs referrers of the given subject, when recursive is true also syncs referrers of those referrers.
 // Caller must hold clientLock for reading (uses remote and rc).
 func (service *BaseService) syncReferrers(ctx context.Context, tags []string, localRepo, remoteRepo string,
@@ -1536,7 +1608,7 @@ func (service *BaseService) syncReferrers(ctx context.Context, tags []string, lo
 
 		seen = append(seen, remoteDigest.String())
 
-		referrers, err := service.rc.ReferrerList(ctx, remoteImageRef)
+		referrers, err := service.getReferrers(ctx, remoteRepo, remoteImageRef, remoteDigest)
 		if err != nil {
 			return err
 		}

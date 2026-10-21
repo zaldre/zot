@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
@@ -5873,6 +5875,278 @@ func TestOnDemandWithDigest(t *testing.T) {
 	})
 }
 
+func TestSyncDigestNamedTag(t *testing.T) {
+	Convey("Verify a tag that names its own digest is synced like any other tag", t, func() {
+		// oc-mirror renders repo@sha256:x as repo:sha256-x, so the tag carries the
+		// referrers fallback shape while naming the manifest it resolves to. A referrers
+		// tag names the SUBJECT's digest and so never matches its own target, which is
+		// what tells the two apart.
+		sctlr, _, _ := makeUpstreamServer(t, false, false)
+
+		scm := test.NewControllerManager(sctlr)
+		srcBaseURL := scm.StartAndWait()
+
+		defer scm.StopServer()
+
+		resp, err := resty.R().Get(srcBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		manifestBlob := resp.Body()
+		manifestDigest := godigest.FromBytes(manifestBlob)
+		digestNamedTag := manifestDigest.Algorithm().String() + "-" + manifestDigest.Encoded()
+
+		resp, err = resty.R().SetHeader("Content-type", ispec.MediaTypeImageManifest).
+			SetBody(manifestBlob).
+			Put(srcBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
+
+		var tlsVerify bool
+
+		maxRetries := 1
+		delay := 1 * time.Second
+
+		Convey("on demand", func() {
+			syncRegistryConfig := syncconf.RegistryConfig{
+				Content:    []syncconf.Content{{Prefix: testImage}},
+				URLs:       []string{srcBaseURL},
+				OnDemand:   true,
+				TLSVerify:  &tlsVerify,
+				MaxRetries: &maxRetries,
+				RetryDelay: &delay,
+			}
+
+			defaultVal := true
+			syncConfig := &syncconf.Config{
+				Enable:     &defaultVal,
+				Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+			}
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			// This is the pull-through reported on the issue: upstream serves the
+			// reference, downstream used to answer MANIFEST_UNKNOWN.
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, manifestDigest)
+
+			// It is committed as a tag, not merely pullable by digest.
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(string(resp.Body()), ShouldContainSubstring, digestNamedTag)
+		})
+
+		Convey("periodic", func() {
+			updateDuration, _ := time.ParseDuration("30m")
+
+			syncRegistryConfig := syncconf.RegistryConfig{
+				Content:      []syncconf.Content{{Prefix: testImage}},
+				URLs:         []string{srcBaseURL},
+				PollInterval: updateDuration,
+				TLSVerify:    &tlsVerify,
+				MaxRetries:   &maxRetries,
+				RetryDelay:   &delay,
+			}
+
+			defaultVal := true
+			syncConfig := &syncconf.Config{
+				Enable:     &defaultVal,
+				Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+			}
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, testImage, 60*time.Second), ShouldBeTrue)
+
+			// OnDemand is off, so a hit here can only come from the periodic run.
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, manifestDigest)
+
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(string(resp.Body()), ShouldContainSubstring, digestNamedTag)
+		})
+	})
+}
+
+// startNoReferrersAPIProxy fronts baseURL as a registry without the referrers API, so clients fall back
+// to the referrers tag schema.
+func startNoReferrersAPIProxy(t *testing.T, baseURL string) string {
+	t.Helper()
+
+	target, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/referrers/") {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	return server.URL
+}
+
+func TestSyncDigestNamedTagReferrers(t *testing.T) {
+	Convey("Verify an image tagged by its own digest syncs periodically alongside its referrers", t, func() {
+		// The tag "sha256-<digest>" is also the image's referrers fallback tag, both upstream when there is
+		// no referrers API and in the temp layout sync stages content in.
+		sctlr, _, _ := makeUpstreamServer(t, false, false)
+
+		scm := test.NewControllerManager(sctlr)
+		srcBaseURL := scm.StartAndWait()
+
+		defer scm.StopServer()
+
+		const repoName = "digest-named"
+
+		var tlsVerify bool
+
+		defaultVal := true
+
+		syncRegistryConfig := syncconf.RegistryConfig{
+			Content:      []syncconf.Content{{Prefix: repoName}},
+			URLs:         []string{srcBaseURL},
+			PollInterval: 30 * time.Minute,
+			TLSVerify:    &tlsVerify,
+			MaxRetries:   &maxRetries,
+		}
+
+		syncConfig := &syncconf.Config{
+			Enable:     &defaultVal,
+			Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+		}
+
+		Convey("an image with a referrer keeps its tag", func() {
+			image := CreateRandomImage()
+			digestNamedTag := "sha256-" + image.Digest().Encoded()
+
+			referrer := CreateRandomImageWith().Subject(image.DescriptorRef()).
+				ArtifactType("application/vnd.test.artifact").Build()
+
+			So(UploadImage(image, srcBaseURL, repoName, digestNamedTag), ShouldBeNil)
+			So(UploadImage(referrer, srcBaseURL, repoName, referrer.Digest().String()), ShouldBeNil)
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, repoName, 60*time.Second), ShouldBeTrue)
+
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, image.Digest())
+
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + repoName + "/referrers/" + image.Digest().String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			var referrers ispec.Index
+
+			So(json.Unmarshal(resp.Body(), &referrers), ShouldBeNil)
+			So(referrers.Manifests, ShouldHaveLength, 1)
+			So(referrers.Manifests[0].Digest, ShouldEqual, referrer.Digest())
+		})
+
+		Convey("onlySigned with an upstream without the referrers API", func() {
+			image := CreateRandomImage()
+			digestNamedTag := "sha256-" + image.Digest().Encoded()
+
+			So(UploadImage(image, srcBaseURL, repoName, digestNamedTag), ShouldBeNil)
+			So(UploadImage(CreateRandomImage(), srcBaseURL, repoName, digestNamedTag+".sig"), ShouldBeNil)
+			So(UploadImage(CreateRandomImage(), srcBaseURL, repoName, "1.0.0"), ShouldBeNil)
+
+			syncConfig.Registries[0].URLs = []string{startNoReferrersAPIProxy(t, srcBaseURL)}
+			syncConfig.Registries[0].OnlySigned = &defaultVal
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			// The fallback tag is the image itself, not a referrers index, which must not fail the repo.
+			So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, repoName, 60*time.Second), ShouldBeTrue)
+
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, image.Digest())
+
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/1.0.0")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		})
+
+		Convey("an index with an upstream without the referrers API keeps the platforms filter", func() {
+			amd64Image := CreateImageWith().DefaultLayers().PlatformConfig("amd64", "linux").Build()
+			arm64Image := CreateImageWith().DefaultLayers().PlatformConfig("arm64", "linux").Build()
+			multiarchImage := CreateMultiarchWith().Images([]Image{amd64Image, arm64Image}).Build()
+			digestNamedTag := "sha256-" + multiarchImage.Digest().Encoded()
+
+			So(UploadMultiarchImage(multiarchImage, srcBaseURL, repoName, digestNamedTag), ShouldBeNil)
+
+			syncConfig.Registries[0].URLs = []string{startNoReferrersAPIProxy(t, srcBaseURL)}
+			syncConfig.Registries[0].Platforms = []string{"linux/amd64"}
+
+			dctlr, _, destClient := makeDownstreamServer(t, false, syncConfig)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, repoName, 60*time.Second), ShouldBeTrue)
+
+			resp, err := destClient.R().SetHeader("Accept", ispec.MediaTypeImageIndex).
+				Get(destBaseURL + "/v2/" + repoName + "/manifests/" + digestNamedTag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, multiarchImage.Digest())
+
+			resp, err = destClient.R().SetHeader("Accept", ispec.MediaTypeImageManifest).
+				Get(destBaseURL + "/v2/" + repoName + "/manifests/" + amd64Image.Digest().String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// The fallback tag is the index itself; its children are not referrers to copy in full.
+			resp, err = destClient.R().SetHeader("Accept", ispec.MediaTypeImageManifest).
+				Get(destBaseURL + "/v2/" + repoName + "/manifests/" + arm64Image.Digest().String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		})
+	})
+}
+
 func TestOnDemandRetryGoroutineErr(t *testing.T) {
 	Convey("Verify ondemand sync retries in background on error", t, func() {
 		regex := ".*"
@@ -9072,7 +9346,7 @@ type syncRepoLogEntry struct {
 
 // waitFinishedSyncingRepo polls logPath until a JSON line reports finished sync for repo.
 // Unmarshaling avoids depending on JSON key order in the log line.
-func waitFinishedSyncingRepo(logPath, repo string, timeout time.Duration) bool {
+func waitFinishedSyncingRepo(logPath, repo string, timeout time.Duration) bool { //nolint:unparam // set per caller
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {

@@ -200,7 +200,9 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 	*seen = append(*seen, desc.Digest)
 
 	imageStore := registry.storeController.GetImageStore(repo)
-	isReferrersRef := common.IsReferrersTag(reference)
+
+	// A tag naming its own digest is an image tagged by digest, not a referrers tag, and is committed.
+	isReferrersRef := common.IsReferrersEntry(reference, desc.Digest)
 
 	manifestContent := desc.Data
 	if manifestContent == nil {
