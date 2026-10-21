@@ -530,6 +530,33 @@ func RunParseStorageTests(rootDir string, metaDB mTypes.MetaDB, log log.Logger) 
 		So(stats.PushTimestamp, ShouldHappenWithin, time.Minute, pushedAt)
 	})
 
+	Convey("Index images tagged by their own digest, skip referrers tags", func() {
+		imageStore := local.NewImageStore(rootDir, false, false,
+			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+		storeController := storage.StoreController{DefaultStore: imageStore}
+
+		// oc-mirror writes repo@sha256:x as repo:sha256-x, so the tag names its own manifest.
+		digestNamed := CreateRandomImage()
+		digestNamedTag := "sha256-" + digestNamed.Digest().Encoded()
+
+		// A referrers tag names its subject, never the manifest it points to.
+		referrers := CreateRandomImage()
+		referrersTag := "sha256-" + godigest.FromString("subject").Encoded()
+
+		So(WriteImageToFileSystem(digestNamed, repo, digestNamedTag, storeController), ShouldBeNil)
+		So(WriteImageToFileSystem(referrers, repo, referrersTag, storeController), ShouldBeNil)
+
+		err := meta.ParseStorage(metaDB, storeController, log) //nolint: contextcheck
+		So(err, ShouldBeNil)
+
+		repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+		So(err, ShouldBeNil)
+		So(repoMeta.Tags, ShouldContainKey, digestNamedTag)
+		So(repoMeta.Tags[digestNamedTag].Digest, ShouldEqual, digestNamed.Digest().String())
+		So(repoMeta.Tags, ShouldNotContainKey, referrersTag)
+	})
+
 	Convey("Test with simple case", func() {
 		imageStore := local.NewImageStore(rootDir, false, false,
 			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)

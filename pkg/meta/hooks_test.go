@@ -448,6 +448,69 @@ func TestOnUpdateManifest(t *testing.T) {
 	})
 }
 
+func TestHooksDigestNamedTag(t *testing.T) {
+	Convey("Images tagged by their own digest go through the hooks, referrers tags do not", t, func() {
+		rootDir := t.TempDir()
+		storeController := storage.StoreController{}
+		log := log.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+
+		storeController.DefaultStore = local.NewImageStore(rootDir, true, true, log, metrics, nil, nil, nil, nil)
+
+		params := boltdb.DBParameters{RootDir: rootDir}
+		boltDriver, err := boltdb.GetBoltDriver(params)
+		So(err, ShouldBeNil)
+
+		metaDB, err := boltdb.New(boltDriver, log)
+		So(err, ShouldBeNil)
+
+		ctx := context.Background()
+		imgStore := storeController.GetImageStore("repo")
+
+		// oc-mirror writes repo@sha256:x as repo:sha256-x, so the tag names its own manifest.
+		digestNamed := CreateRandomImage()
+		digestNamedTag := "sha256-" + digestNamed.Digest().Encoded()
+
+		// A referrers tag names its subject, never the manifest it points to.
+		referrers := CreateRandomImage()
+		referrersTag := "sha256-" + godigest.FromString("subject").Encoded()
+
+		// Keeps the repo alive once the digest-named tag is deleted.
+		other := CreateRandomImage()
+
+		for tag, image := range map[string]Image{digestNamedTag: digestNamed, referrersTag: referrers, "latest": other} {
+			So(WriteImageToFileSystem(image, "repo", tag, storeController), ShouldBeNil)
+			So(meta.OnUpdateManifest(ctx, "repo", tag, ispec.MediaTypeImageManifest, image.Digest(),
+				image.ManifestDescriptor.Data, storeController, metaDB, log), ShouldBeNil)
+		}
+
+		repoMeta, err := metaDB.GetRepoMeta(ctx, "repo")
+		So(err, ShouldBeNil)
+		So(repoMeta.Tags, ShouldContainKey, digestNamedTag)
+		So(repoMeta.Tags[digestNamedTag].Digest, ShouldEqual, digestNamed.Digest().String())
+		So(repoMeta.Tags, ShouldNotContainKey, referrersTag)
+
+		So(meta.OnGetManifest("repo", digestNamedTag, ispec.MediaTypeImageManifest, digestNamed.ManifestDescriptor.Data,
+			storeController, metaDB, log), ShouldBeNil)
+		So(meta.OnGetManifest("repo", referrersTag, ispec.MediaTypeImageManifest, referrers.ManifestDescriptor.Data,
+			storeController, metaDB, log), ShouldBeNil)
+
+		repoMeta, err = metaDB.GetRepoMeta(ctx, "repo")
+		So(err, ShouldBeNil)
+		So(repoMeta.Statistics[digestNamed.Digest().String()].DownloadCount, ShouldEqual, 1)
+		So(repoMeta.Statistics[referrers.Digest().String()].DownloadCount, ShouldEqual, 0)
+
+		So(imgStore.DeleteImageManifest(ctx, "repo", digestNamedTag, false), ShouldBeNil)
+		So(meta.OnDeleteManifest("repo", digestNamedTag, ispec.MediaTypeImageManifest, digestNamed.Digest(),
+			digestNamed.ManifestDescriptor.Data, storeController, metaDB, log), ShouldBeNil)
+
+		repoMeta, err = metaDB.GetRepoMeta(ctx, "repo")
+		So(err, ShouldBeNil)
+		So(repoMeta.Tags, ShouldNotContainKey, digestNamedTag)
+		So(repoMeta.Tags, ShouldContainKey, "latest")
+	})
+}
+
 func TestOnUpdateManifest_TagOverwriteKeepsPriorDigestStats(t *testing.T) {
 	Convey("Tag overwrite leaves prior digest Statistics in MetaDB until GC", t, func() {
 		rootDir := t.TempDir()
@@ -502,13 +565,16 @@ func TestUpdateErrors(t *testing.T) {
 		metaDB := mocks.MetaDBMock{}
 		log := log.NewTestLogger()
 
+		// A referrers tag carries the full hex encoding of the subject digest.
+		referrersTag := "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 		Convey("IsReferrersTag true update", func() {
-			err := meta.OnUpdateManifest(context.Background(), "repo", "sha256-123", "digest", "media", []byte("bad"),
-				storeController, metaDB, log)
+			err := meta.OnUpdateManifest(context.Background(), "repo", referrersTag, "digest", "media",
+				[]byte("bad"), storeController, metaDB, log)
 			So(err, ShouldBeNil)
 		})
 		Convey("IsReferrersTag true delete", func() {
-			err := meta.OnDeleteManifest("repo", "sha256-123", "digest", "media", []byte("bad"),
+			err := meta.OnDeleteManifest("repo", referrersTag, "digest", "media", []byte("bad"),
 				storeController, metaDB, log)
 			So(err, ShouldBeNil)
 		})

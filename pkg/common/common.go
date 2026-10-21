@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -152,12 +154,30 @@ func ContainsStringIgnoreCase(strSlice []string, str string) bool {
 	})
 }
 
-// IsReferrersTag checks if tag is a referrers tag
-// (https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema).
-func IsReferrersTag(tag string) bool {
-	referrersTagRule := regexp.MustCompile(`sha256\-[A-Za-z0-9]*$`)
+// Referrers tags are exactly "sha256-<64 lowercase hex>", lowercase like go-digest's sha256 encoding.
+// Anchoring keeps tags that merely end in a digest, such as "v1-sha256-<hex>", ordinary tags.
+var referrersTagRule = regexp.MustCompile(`^sha256-[a-f0-9]{64}$`)
 
+// IsReferrersTag checks if tag has the referrers tag schema shape
+// (https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema).
+// Images tagged by their own digest share that shape, use IsReferrersEntry to tell them apart.
+func IsReferrersTag(tag string) bool {
 	return referrersTagRule.MatchString(tag)
+}
+
+// IsDigestNamedTag reports whether tag names the digest of the manifest it points to, which is what
+// mirroring tools write for digest-pinned sources (oc-mirror renders "repo@sha256:x" as "repo:sha256-x").
+func IsDigestNamedTag(tag string, dgst digest.Digest) bool {
+	// Algorithm() and Encoded() panic on a digest without a separator.
+	alg, encoded, found := strings.Cut(dgst.String(), ":")
+
+	return found && tag == alg+"-"+encoded
+}
+
+// IsReferrersEntry reports whether tag, pointing at the manifest dgst, is a referrers tag. A referrers
+// tag names its subject's digest, never its own, so a tag naming its own target is an ordinary image.
+func IsReferrersEntry(tag string, dgst digest.Digest) bool {
+	return IsReferrersTag(tag) && !IsDigestNamedTag(tag, dgst)
 }
 
 func IsContextDone(ctx context.Context) bool {
